@@ -19,6 +19,7 @@ ytdl_format_options = {
     'quiet': True,
     'no_warnings': True,
     'extract_flat': False,
+    'cookiefile': 'cookies.txt',  # ← ここを追加
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
