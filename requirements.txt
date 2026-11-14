@@ -3,3 +3,4 @@ yt-dlp
 gTTS
 aiohttp
 PyNaCl
+ffmpeg 
