@@ -8,17 +8,26 @@ import yt_dlp
 from gtts import gTTS
 from keep_alive import start_web_server
 
-# --- yt-dlp と FFmpeg の設定 ---
-YTDL_OPTIONS = {
+# --- yt-dlp の設定（音声抽出の安定化） ---
+ytdl_format_options = {
     'format': 'bestaudio/best',
+    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
+    'restrictfilenames': True,
     'noplaylist': True,
     'default_search': 'ytsearch',
+    'source_address': '0.0.0.0',
     'quiet': True,
     'no_warnings': True,
     'extract_flat': False,
 }
-ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
-FFMPEG_BEFORE_OPTIONS = '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+
+ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
+
+# --- FFmpegのオプション設定（音切れ防止） ---
+FFMPEG_OPTIONS = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin',
+    'options': '-vn -b:a 192k'
+}
 
 # --- Botの設定 ---
 intents = discord.Intents.default()
@@ -55,18 +64,24 @@ def get_state(guild_id):
         }
     return guild_states[guild_id]
 
-def get_ffmpeg_options(state):
+def get_ffmpeg_source(url, state):
     filters = []
     if state['nightcore']:
         filters.append("asetrate=44100*1.25,aresample=44100,atempo=1.05")
     if state['bassboost']:
         filters.append("bass=g=10:f=110:w=0.6")
     
-    filter_str = f"-af {','.join(filters)}" if filters else ""
-    return {
-        'before_options': FFMPEG_BEFORE_OPTIONS,
-        'options': f'-vn {filter_str}'.strip()
-    }
+    options = FFMPEG_OPTIONS['options']
+    if filters:
+        filter_str = ','.join(filters)
+        options = f'-vn -af "{filter_str}"'
+
+    return discord.FFmpegPCMAudio(
+        url,
+        executable="ffmpeg",
+        before_options=FFMPEG_OPTIONS['before_options'],
+        options=options
+    )
 
 # --- 操作用ボタン（UI View） ---
 class MusicControls(discord.ui.View):
@@ -106,7 +121,7 @@ class MusicControls(discord.ui.View):
             vc.stop()
             await interaction.response.send_message("⏹️ 再生を停止しました。", ephemeral=True)
         else:
-            await interaction.response.send_message("再生中の曲はありません。", ephemeral=True)
+            await interaction.response.send_message("再生中の曲がありません。", ephemeral=True)
 
     @discord.ui.button(label="キュー確認", style=discord.ButtonStyle.success, emoji="📜")
     async def queue_list(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -150,12 +165,15 @@ async def play_next(guild: discord.Guild, channel: discord.abc.Messageable):
             data = data['entries'][0]
         url = data['url']
     except Exception as e:
-        await channel.send(f"⚠️ 再生エラー（スキップします）: {e}")
+        await channel.send(f"⚠️ 再生エラーが発生しました（スキップします）: {e}")
         return await play_next(guild, channel)
 
-    ffmpeg_opts = get_ffmpeg_options(state)
-    source = discord.FFmpegPCMAudio(url, **ffmpeg_opts)
-    source = discord.PCMVolumeTransformer(source, volume=state['volume'])
+    try:
+        source = get_ffmpeg_source(url, state)
+        source = discord.PCMVolumeTransformer(source, volume=state['volume'])
+    except Exception as e:
+        await channel.send(f"⚠️ 音声ソースの作成に失敗しました: {e}")
+        return
 
     def after_playing(error):
         if error:
@@ -183,16 +201,19 @@ async def process_tts(guild: discord.Guild):
         vc = guild.voice_client
         if vc and vc.is_connected() and not vc.is_playing():
             filename = f"tts_{guild.id}.mp3"
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, lambda: gTTS(text=text, lang='ja').save(filename))
-            
-            done_event = asyncio.Event()
-            source = discord.FFmpegPCMAudio(filename)
-            vc.play(source, after=lambda e: bot.loop.call_soon_threadsafe(done_event.set))
-            await done_event.wait()
-            
-            if os.path.exists(filename):
-                os.remove(filename)
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, lambda: gTTS(text=text, lang='ja').save(filename))
+                
+                done_event = asyncio.Event()
+                source = discord.FFmpegPCMAudio(filename, executable="ffmpeg")
+                vc.play(source, after=lambda e: bot.loop.call_soon_threadsafe(done_event.set))
+                await done_event.wait()
+            except Exception as e:
+                print(f"TTS Error: {e}")
+            finally:
+                if os.path.exists(filename):
+                    os.remove(filename)
         state['tts_queue'].task_done()
 
     state['is_speaking_tts'] = False
@@ -354,7 +375,7 @@ async def nowplaying(interaction: discord.Interaction):
     if state['current']:
         await interaction.response.send_message(f"🎵 現在再生中: **{state['current']['title']}**")
     else:
-        await interaction.response.send_message("現在再生中の曲はありません。")
+        await interaction.response.send_message("現在再生中の曲はありません。", ephemeral=True)
 
 @bot.tree.command(name="remove", description="キューから指定番号の曲を削除します")
 @app_commands.describe(index="削除するキュー番号")
